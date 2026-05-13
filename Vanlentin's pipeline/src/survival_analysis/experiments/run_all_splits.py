@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-全スプリットを実行して平均 C-index と IBS を計算するラッパースクリプト。
+Wrapper script that runs all splits and reports mean C-index and IBS.
 
-実行方法:
+Usage:
     cd "Vanlentin's pipeline"
     python -m survival_analysis.experiments.run_all_splits
 """
@@ -32,9 +32,9 @@ NB_EVAL_TESTS = 100
 
 
 def run_single_split(split_index: int, n_splits: int) -> tuple[float, float, float]:
-    """1つのスプリットで訓練・評価を実行して (C-index, IBS, C-index標準偏差) を返す。"""
+    """Train and evaluate on one split; return (C-index, IBS, C-index std)."""
     print(f"\n{'='*55}")
-    print(f"  スプリット {split_index + 1} / {n_splits} を実行中...")
+    print(f"  Running split {split_index + 1} / {n_splits} ...")
     print(f"{'='*55}")
 
     datamodule = MetabricGraphSurvivalDataModule(
@@ -79,7 +79,7 @@ def main() -> None:
     with open(SPLITS_JSON) as f:
         splits = json.load(f)
     n_splits = len(splits)
-    print(f"\n{n_splits} スプリットの実験を開始します（合計 {n_splits} 回訓練）\n")
+    print(f"\nStarting experiment over {n_splits} splits ({n_splits} training runs total)\n")
 
     all_cindices: list[float] = []
     all_briers: list[float] = []
@@ -99,22 +99,22 @@ def main() -> None:
         })
 
     print(f"\n{'='*55}")
-    print("  全スプリットの結果まとめ")
+    print("  Summary across all splits")
     print(f"{'='*55}")
-    print(f"  平均  C-index : {np.mean(all_cindices):.4f} ± {np.std(all_cindices):.4f}")
-    print(f"  平均  IBS     : {np.mean(all_briers):.4f} ± {np.std(all_briers):.4f}")
+    print(f"  Mean C-index : {np.mean(all_cindices):.4f} ± {np.std(all_cindices):.4f}")
+    print(f"  Mean IBS     : {np.mean(all_briers):.4f} ± {np.std(all_briers):.4f}")
     print(f"{'='*55}\n")
 
     results_df = pd.DataFrame(rows)
     summary = pd.DataFrame([
         {
-            "split_index": "全体平均",
+            "split_index": "mean",
             "c_index": round(np.mean(all_cindices), 4),
             "ibs": round(np.mean(all_briers), 4),
             "c_index_std_within_split": round(np.mean(all_stds), 4),
         },
         {
-            "split_index": "標準偏差",
+            "split_index": "std",
             "c_index": round(np.std(all_cindices), 4),
             "ibs": round(np.std(all_briers), 4),
             "c_index_std_within_split": round(np.std(all_stds), 4),
@@ -124,7 +124,7 @@ def main() -> None:
 
     output_path = REPO_ROOT / "results_all_splits.csv"
     results_df.to_csv(output_path, index=False)
-    print(f"結果を保存しました: {output_path}")
+    print(f"Results saved to: {output_path}")
 
 
 if __name__ == "__main__":
