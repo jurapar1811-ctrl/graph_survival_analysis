@@ -17,3 +17,7 @@ node_modules/
 package-lock.json
 package.json
 tests.ipynb
+
+# Large Jupyter notebooks
+surv_epn/main/Notebooks/codes_to_transmit_EPN.ipynb
+surv_epn/main/Notebooks/finalcodes_MLTcensEPN.ipynb
