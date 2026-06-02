@@ -664,11 +664,13 @@ class EPN_surv(torch.nn.Module):
     @staticmethod
     def _sorted_input_target(input, target):
         durations, _ = target.t()
-        idx_sort = np.argsort(durations)
-        if (idx_sort == np.arange(0, len(idx_sort))):#.all():
+        # Convert to numpy to avoid RuntimeError when torch.__array_function__ returns a tensor
+        durations_np = durations.detach().cpu().numpy()
+        idx_sort = np.argsort(durations_np)
+        if (idx_sort == np.arange(0, len(idx_sort))).all():#.all():
             return input, target
         input = tt.tuplefy(input).iloc[idx_sort] #tuple with a tensor of shape [batch size][nb timepoints survival] #print(input[0].shape)
-        target = tt.tuplefy(target).iloc[idx_sort] #tuple with a tensor of shape [batch size][label size (=2)] #print(target[0].shape)        
+        target = tt.tuplefy(target).iloc[idx_sort] #tuple with a tensor of shape [batch size][label size (=2)] #print(target[0].shape)
         return input, target
     
 
