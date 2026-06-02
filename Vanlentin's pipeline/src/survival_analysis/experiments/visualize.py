@@ -81,20 +81,20 @@ def plot_patient_graph(base_dm):
     # 患者ノードを描画（色分け: イベントあり=オレンジ、打ち切り=水色）
     ax.scatter(
         coords[events == 0, 0], coords[events == 0, 1],
-        c="#3182bd", s=18, alpha=0.7, label=f"打ち切り ({(events==0).sum()}人)",
+        c="#3182bd", s=18, alpha=0.7, label=f"Censored ({(events==0).sum()})",
         zorder=2, edgecolors="white", linewidths=0.3,
     )
     ax.scatter(
         coords[events == 1, 0], coords[events == 1, 1],
-        c="#e6550d", s=18, alpha=0.7, label=f"イベントあり ({(events==1).sum()}人)",
+        c="#e6550d", s=18, alpha=0.7, label=f"Event ({(events==1).sum()})",
         zorder=2, edgecolors="white", linewidths=0.3,
     )
 
     ax.set_xlabel(f"PC1 ({var_ratio[0]*100:.1f}%)", fontsize=12)
     ax.set_ylabel(f"PC2 ({var_ratio[1]*100:.1f}%)", fontsize=12)
     ax.set_title(
-        f"患者類似グラフ（k-NN, k={GRAPH_K}, コサイン類似度）\n"
-        f"PCA 2次元投影 — 訓練患者 {len(features)} 人",
+        f"Patient Similarity Graph (k-NN, k={GRAPH_K}, cosine similarity)\n"
+        f"PCA 2D projection — {len(features)} training patients",
         fontsize=13,
     )
     ax.legend(fontsize=11, loc="upper right")
@@ -142,8 +142,8 @@ def plot_survival_curves(base_dm, epn_dm, epn_module):
     censor_idx = np.where(val_y[:, 1] == 0)[0][:2]
     chosen = np.concatenate([event_idx, censor_idx])
     titles = [
-        "患者1（イベントあり）", "患者2（イベントあり）",
-        "患者3（打ち切り）",     "患者4（打ち切り）",
+        "Patient 1 (event)", "Patient 2 (event)",
+        "Patient 3 (censored)", "Patient 4 (censored)",
     ]
 
     fig, axes = plt.subplots(2, 2, figsize=(13, 8))
@@ -155,24 +155,24 @@ def plot_survival_curves(base_dm, epn_dm, epn_module):
         is_event   = int(val_y[i, 1])
 
         ax.plot(mlp_times, mlp_surv_df.iloc[:, pat_global].values,
-                color="#74c476", linewidth=2.2, label="MLP 予測")
+                color="#74c476", linewidth=2.2, label="MLP prediction")
         ax.plot(timepoints, epn_corr[i],
-                color="#fd8d3c", linewidth=2.2, linestyle="--", label="EPN 補正後")
+                color="#fd8d3c", linewidth=2.2, linestyle="--", label="EPN corrected")
         ax.axvline(t_event, color="gray", linestyle=":", linewidth=1.2)
         ax.text(t_event + 4, 0.88,
-                f"{'イベント' if is_event else '打ち切り'}\n({t_event:.0f}ヶ月)",
+                f"{'Event' if is_event else 'Censored'}\n({t_event:.0f}m)",
                 fontsize=9, color="gray")
         ax.set_xlim(0, max(mlp_times[-1], timepoints[-1]) * 1.05)
         ax.set_ylim(-0.05, 1.08)
-        ax.set_xlabel("時間（ヶ月）", fontsize=10)
-        ax.set_ylabel("生存確率", fontsize=10)
+        ax.set_xlabel("Time (months)", fontsize=10)
+        ax.set_ylabel("Survival probability", fontsize=10)
         ax.set_title(title, fontsize=12)
         ax.legend(fontsize=9)
         ax.spines["top"].set_visible(False)
         ax.spines["right"].set_visible(False)
 
     fig.suptitle(
-        "生存曲線：MLP ベースライン vs EPN 補正後\n（スプリット1・検証患者の例）",
+        "Survival Curves: MLP Baseline vs EPN Corrected\n(Split 1 — validation patients)",
         fontsize=13, y=1.01,
     )
     plt.tight_layout()
