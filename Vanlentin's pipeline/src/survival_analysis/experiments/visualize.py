@@ -16,10 +16,20 @@ from functools import partial
 from pathlib import Path
 
 import numpy as np
+import matplotlib
 import matplotlib.pyplot as plt
+import matplotlib.font_manager as fm
 import torch
 import lightning as pl
 from sklearn.decomposition import PCA
+
+# 日本語フォント設定（macOS 標準の Hiragino Sans を優先使用）
+_jp_candidates = ["Hiragino Sans", "Noto Sans JP", "AppleGothic", "YuGothic"]
+_available = {f.name for f in fm.fontManager.ttflist}
+_jp_font = next((f for f in _jp_candidates if f in _available), None)
+if _jp_font:
+    matplotlib.rcParams["font.family"] = _jp_font
+matplotlib.rcParams["axes.unicode_minus"] = False
 
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
