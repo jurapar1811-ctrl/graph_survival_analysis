@@ -1,13 +1,16 @@
 #!/usr/bin/env python3
 """
-EPNModule: Error Propagation Network wrapped as a PyTorch Lightning module.
+EPNModule: Graph-based Error Propagation Network as a PyTorch Lightning module.
 
-All EPN logic is implemented here from scratch — no imports from surv_epn.
-surv_epn/ is kept in the workspace as a reference only.
+Architecture
+------------
+- A k-NN patient similarity graph (built by EPNDataModule using graph_builder.py)
+  determines *which* patients are neighbours for each query patient.
+- A learned attention mechanism (key/query projections) determines *how much*
+  weight to give each neighbour's prediction error.
+- The weighted errors are added to the MLP baseline prediction as a correction.
 
-Core idea: given MLP survival-curve predictions for all patients, EPN
-learns an attention mechanism that corrects each patient's prediction by
-looking at similar patients' prediction errors.
+No imports from surv_epn — all logic is self-contained here.
 """
 
 from typing import List
@@ -23,40 +26,31 @@ from pycox.models.loss import CoxCCLoss
 
 
 # ---------------------------------------------------------------------------
-# Standalone helpers (mirror of surv_epn/functions/survival.py and epn.py)
+# Standalone helpers
 # ---------------------------------------------------------------------------
 
 def _get_hazard_from_survival_curve(pred: torch.Tensor) -> torch.Tensor:
     """Convert survival curve [N, T] to discrete hazard [N, T]."""
     cum_hazard = -torch.log(torch.clamp(pred, min=1e-9))
-    return torch.diff(cum_hazard, prepend=torch.zeros(cum_hazard.shape[0], 1))
-
-
-def _compute_attention(
-    key_proj: nn.Linear,
-    query_proj: nn.Linear,
-    dk: torch.Tensor,
-    x_query: torch.Tensor,
-    x_key: torch.Tensor,
-) -> torch.Tensor:
-    """Scaled dot-product attention (learned projections)."""
-    return torch.matmul(key_proj(x_query), query_proj(x_key).t()) / dk
+    return torch.diff(cum_hazard, prepend=torch.zeros(pred.shape[0], 1))
 
 
 # ---------------------------------------------------------------------------
-# Core EPN model (no surv_epn dependency)
+# Core EPN model
 # ---------------------------------------------------------------------------
 
 class EPNModel(nn.Module):
     """
-    Error Propagation Network for survival analysis.
+    Graph-based Error Propagation Network.
 
-    Input: pandas DataFrame with
-      - string time-point columns (MLP survival curves)
-      - feat_X feature columns
-      - management columns (split, pat_to_compute, batch, label_*)
+    forward() inputs
+    ----------------
+    df      : pd.DataFrame  — patient data (features, MLP survival curves, mgmt cols)
+    nn_idx  : torch.Tensor [N, k]  — precomputed k-NN neighbour indices from graph_builder
 
-    Output: corrected survival curves [n_batch_patients, T]
+    forward() output
+    ----------------
+    torch.Tensor [n_batch, T] — graph-corrected survival curves for the batch patients
     """
 
     _MGMT_COLS = {"label_duration", "label_event", "split",
@@ -65,7 +59,6 @@ class EPNModel(nn.Module):
     def __init__(
         self,
         input_size: int,
-        prop_neighbors: float = 0.1,
         temp_att: float = 1.0,
         alpha: float = 0.0,
         beta: float = 0.0,
@@ -73,13 +66,13 @@ class EPNModel(nn.Module):
     ) -> None:
         super().__init__()
         self._input_size = input_size
-        self._prop_neighbors = prop_neighbors
         self._temperature = temp_att
         self._alpha = alpha
         self._beta = beta
         self._n_control = n_control
         self._dk = torch.sqrt(torch.tensor(float(input_size)))
 
+        # Learnable projections for attention scoring
         self._key_projection = nn.Linear(input_size, input_size)
         self._query_projection = nn.Linear(input_size, input_size)
         self._criterion = CoxCCLoss(shrink=0.0)
@@ -88,51 +81,78 @@ class EPNModel(nn.Module):
     # Forward pass
     # ------------------------------------------------------------------
 
-    def forward(self, df: pd.DataFrame) -> torch.Tensor:
-        """Return corrected survival curves for batch patients [n_batch, T]."""
-        # Extract time-point columns (float-parseable, not feat_* or mgmt)
-        tp_cols_sorted = self._get_timepoint_cols(df)
-        preds = torch.from_numpy(df[tp_cols_sorted].values).float()          # [N, T]
+    def forward(self, df: pd.DataFrame, nn_idx: torch.Tensor) -> torch.Tensor:
+        """
+        Graph-corrected survival curves for batch patients.
+
+        For each batch patient i:
+          1. Look up its k neighbours from nn_idx[i].
+          2. Compute attention scores to those k neighbours (learned projections).
+          3. Mask self-attention and (in val mode) test-to-test attention.
+          4. Correction = softmax(att) · errors[neighbours].
+          5. Return MLP_pred[i] + correction[i].
+
+        Memory: [n_batch, k, T]  (vs [n_batch, n_batch, T] in the attention-only approach)
+        """
+        tp_cols = self._get_timepoint_cols(df)
+        T = len(tp_cols)
+        preds = torch.from_numpy(df[tp_cols].values).float()            # [N, T]
         labels = torch.from_numpy(
             df[["label_duration", "label_event"]].values
-        ).float()                                                              # [N, 2]
+        ).float()                                                         # [N, 2]
         feat_cols = [c for c in df.columns if "feat_" in c]
-        features = torch.from_numpy(df[feat_cols].values).float()            # [N, F]
+        features = torch.from_numpy(df[feat_cols].values).float()       # [N, F]
+        F_dim = features.shape[1]
 
-        test_idx = np.where(df.eval("pat_to_compute and batch"))[0]
+        test_idx = np.where(df.eval("pat_to_compute and batch"))[0]     # [n_batch]
+        n_batch = len(test_idx)
         training = (
             len(np.where(df.eval(
                 'pat_to_compute and (split=="val" or split=="test")'
             ))[0]) == 0
         )
 
-        errors = self._compute_error_survival(
-            torch.tensor([float(c) for c in tp_cols_sorted]), preds, labels
-        )                                                                      # [N, T]
+        # Errors for all N patients: [N, T]
+        timepoints = torch.tensor([float(c) for c in tp_cols])
+        errors = self._compute_error_survival(timepoints, preds, labels)
 
-        att = _compute_attention(
-            self._key_projection, self._query_projection, self._dk,
-            features[test_idx], features,
-        )                                                                      # [n_batch, N]
+        # Neighbours for batch patients: [n_batch, k]
+        test_idx_t = torch.tensor(test_idx)
+        neighbour_idx = nn_idx[test_idx_t]                               # [n_batch, k]
+        k = neighbour_idx.shape[1]
 
+        # --- Graph-constrained attention ---
+        # Query: projected features of test patients        [n_batch, F]
+        # Key:   projected features of their k neighbours  [n_batch, k, F]
+        q = self._query_projection(features[test_idx_t])                 # [n_batch, F]
+        neighbour_feats = features[neighbour_idx]                        # [n_batch, k, F]
+        keys = self._key_projection(
+            neighbour_feats.view(-1, F_dim)
+        ).view(n_batch, k, F_dim)                                        # [n_batch, k, F]
+
+        # Scaled dot-product: [n_batch, 1, F] × [n_batch, F, k] → [n_batch, k]
+        att = torch.bmm(q.unsqueeze(1), keys.permute(0, 2, 1)).squeeze(1) / self._dk
+
+        # --- Masking ---
         if not training:
-            full_test_idx = np.where(df["split"].values == "val")[0]
-            att[:, full_test_idx] = torch.finfo(torch.float32).min
+            # Val mode: prevent val patients from attending to other val patients
+            val_patient_idx = torch.tensor(
+                np.where(df["split"].values == "val")[0]
+            )
+            val_mask = torch.isin(neighbour_idx, val_patient_idx)        # [n_batch, k]
+            att = att.masked_fill(val_mask, torch.finfo(torch.float32).min)
         else:
-            att[range(len(test_idx)), test_idx] = torch.finfo(torch.float32).min
+            # Train mode: zero out self-attention
+            self_mask = (neighbour_idx == test_idx_t.unsqueeze(1))       # [n_batch, k]
+            att = att.masked_fill(self_mask, torch.finfo(torch.float32).min)
 
-        if self._prop_neighbors != -1:
-            k = max(round(self._prop_neighbors * att.shape[1]), 1)
-            att, indices = torch.topk(att, k=k, dim=1)   # [n_batch, k]
-            errors = errors[indices]                       # [n_batch, k, T]
-        else:
-            errors = (errors.unsqueeze(1)
-                      .repeat(1, len(test_idx), 1)
-                      .permute(1, 0, 2))                   # [n_batch, N, T]
+        att = F.softmax(att * self._temperature, dim=-1)                 # [n_batch, k]
 
-        att = F.softmax(att * self._temperature, dim=-1)
-        preds_test = preds[test_idx]                       # [n_batch, T]
-        return torch.diagonal(torch.matmul(att, errors), 0).t() + preds_test
+        # Weighted correction: [n_batch, k, T] → [n_batch, T]
+        neighbour_errors = errors[neighbour_idx]                         # [n_batch, k, T]
+        correction = torch.einsum("bk,bkt->bt", att, neighbour_errors)
+
+        return preds[test_idx_t] + correction                            # [n_batch, T]
 
     # ------------------------------------------------------------------
     # Loss
@@ -144,7 +164,7 @@ class EPNModel(nn.Module):
         pred: torch.Tensor,
         y: torch.Tensor,
     ) -> torch.Tensor:
-        """CoxCC loss with elastic-net penalty."""
+        """CoxCC loss with optional elastic-net penalty."""
         l1, l2 = torch.tensor(0.0), torch.tensor(0.0)
         for _, w in self.named_parameters():
             l1 = l1 + w.abs().sum()
@@ -152,8 +172,7 @@ class EPNModel(nn.Module):
 
         pred_hazard = _get_hazard_from_survival_curve(pred)
         g_case, g_control = self._make_case_control(timepoints, pred_hazard, y)
-        main_loss = self._criterion(g_case, g_control)
-        return main_loss + self._alpha * l1 + self._beta * l2
+        return self._criterion(g_case, g_control) + self._alpha * l1 + self._beta * l2
 
     # ------------------------------------------------------------------
     # Private helpers
@@ -165,15 +184,12 @@ class EPNModel(nn.Module):
         pred: torch.Tensor,
         y: torch.Tensor,
     ) -> torch.Tensor:
-        """Error between predicted survival curve and step-function label [N, T]."""
-        T = timepoints.shape[0]
-        N = y.shape[0]
-        # Ideal survival: 1.0 before event, 0.0 after (float from the start)
+        """Signed error between predicted survival curve and step-label [N, T]."""
+        T, N = timepoints.shape[0], y.shape[0]
         cont = torch.where(
             timepoints.repeat(N, 1) > y[:, 0].repeat(T, 1).t(),
             torch.zeros(N, T), torch.ones(N, T),
         )
-        # NaN at censored time-points (event=0)
         nan_fill = torch.full((N, T), float("nan"))
         cont = torch.where(
             (y[:, 1] == 1.0).repeat(T, 1).t(),
@@ -183,9 +199,7 @@ class EPNModel(nn.Module):
         return torch.where(cont.isnan(), torch.zeros_like(cont), cont - pred)
 
     @staticmethod
-    def _sorted_input_target(
-        pred: torch.Tensor, y: torch.Tensor
-    ):
+    def _sorted_input_target(pred: torch.Tensor, y: torch.Tensor):
         durations_np = y[:, 0].detach().cpu().numpy()
         idx_sort = np.argsort(durations_np)
         if (idx_sort == np.arange(len(idx_sort))).all():
@@ -195,7 +209,8 @@ class EPNModel(nn.Module):
 
     @staticmethod
     def _make_at_risk_dict(durations: np.ndarray) -> dict:
-        s = pd.Series(durations)
+        import pandas as _pd
+        s = _pd.Series(durations)
         allidx = s.index.values
         keys = s.drop_duplicates(keep="first")
         return {t: allidx[ix:] for ix, t in keys.items()}
@@ -217,7 +232,6 @@ class EPNModel(nn.Module):
         pred_hazard: torch.Tensor,
         y: torch.Tensor,
     ):
-        """Build (g_case, g_control) tensors for CoxCCLoss."""
         s_pred, s_y = self._sorted_input_target(pred_hazard, y)
         at_risk = self._make_at_risk_dict(s_y[:, 0].detach().cpu().numpy())
         tp_np = timepoints.detach().cpu().numpy()
@@ -227,14 +241,12 @@ class EPNModel(nn.Module):
             [tp_np == s_y[i, 0].item() for i in idx_event]
         )[1]
 
-        # g_case: hazard at event time for each event patient
         idx_case = [[idx_event[i].item(), tp_case[i]] for i in range(len(idx_event))]
         g_case = torch.stack([s_pred[r, c] for r, c in idx_case])
 
-        # g_control: n_control randomly sampled alive patients
         ctrl_idx = self._sample_alive_from_dates(
             s_y[idx_event, 0].detach().cpu().numpy(), at_risk, self._n_control
-        )                                                   # [n_events, n_control]
+        )
         ctrl_fmt = [
             [[ctrl_idx[i, j], tp_case[i]] for i in range(len(idx_event))]
             for j in range(self._n_control)
@@ -243,9 +255,11 @@ class EPNModel(nn.Module):
             torch.stack([s_pred[r, c] for r, c in ctrl_fmt[j]])
             for j in range(self._n_control)
         ]
-        g_control = tt.TupleTree(controls_list[0].unsqueeze(0)) if self._n_control == 1 \
+        g_control = (
+            tt.TupleTree(controls_list[0].unsqueeze(0))
+            if self._n_control == 1
             else tt.TupleTree(tuple(controls_list))
-
+        )
         return g_case, g_control
 
     @staticmethod
@@ -267,7 +281,10 @@ class EPNModel(nn.Module):
 # ---------------------------------------------------------------------------
 
 class EPNModule(pl.LightningModule):
-    """PyTorch Lightning wrapper for EPNModel."""
+    """PyTorch Lightning wrapper for graph-based EPNModel.
+
+    Each batch from EPNDataModule is a dict {"df": ..., "nn_idx": ...}.
+    """
 
     def __init__(
         self,
@@ -278,7 +295,6 @@ class EPNModule(pl.LightningModule):
         alpha: float = 0.0,
         beta: float = 0.0,
         n_control: int = 1,
-        prop_neighbors: float = 0.1,
     ) -> None:
         super().__init__()
         self.save_hyperparameters(ignore=["timepoints"])
@@ -288,26 +304,28 @@ class EPNModule(pl.LightningModule):
 
         self.epn = EPNModel(
             input_size=n_feats,
-            prop_neighbors=prop_neighbors,
             alpha=alpha,
             beta=beta,
             n_control=n_control,
         )
 
-    def training_step(self, batch: pd.DataFrame, batch_idx: int) -> torch.Tensor:
-        corrected = self.epn(batch)
-        computed_mask = batch.eval("pat_to_compute and batch").values
+    def training_step(self, batch: dict, batch_idx: int) -> torch.Tensor:
+        df, nn_idx = batch["df"], batch["nn_idx"]
+        corrected = self.epn(df, nn_idx)
+
+        computed_mask = df.eval("pat_to_compute and batch").values
         labels = torch.tensor(
-            batch[computed_mask][["label_duration", "label_event"]].values,
+            df[computed_mask][["label_duration", "label_event"]].values,
             dtype=torch.float32,
         )
         loss = self.epn.loss(self._timepoints, corrected, labels)
         self.log("train/loss", loss, on_step=False, on_epoch=True, batch_size=1)
         return loss
 
-    def validation_step(self, batch: pd.DataFrame, batch_idx: int) -> None:
+    def validation_step(self, batch: dict, batch_idx: int) -> None:
+        df, nn_idx = batch["df"], batch["nn_idx"]
         with torch.no_grad():
-            corrected = self.epn(batch)
+            corrected = self.epn(df, nn_idx)
         self.log("val/n_preds", float(corrected.shape[0]),
                  on_step=False, on_epoch=True, batch_size=1)
 

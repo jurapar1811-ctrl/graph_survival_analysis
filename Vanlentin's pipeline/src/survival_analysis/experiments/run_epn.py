@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
 """
-Train EPN on top of a frozen MLP for survival analysis on METABRIC.
+Train graph-based EPN on top of a frozen MLP for survival analysis on METABRIC.
 
 Pipeline:
   1. Train MLP (CoxPH loss)         -- same hyper-params as run_mlp.py
   2. Freeze MLP weights
   3. Build EPNDataModule             -- pre-computes MLP survival curves
-  4. Train EPNModule                 -- attention-based correction
+                                        + builds k-NN patient similarity graphs
+  4. Train EPNModule                 -- graph-constrained attention correction
   5. Evaluate on validation split    -- C-index + IBS
 
 Usage:
@@ -42,14 +43,16 @@ MLP_EPOCHS = 110
 EPN_LR = 1e-3
 EPN_WD = 5e-4
 EPN_EPOCHS = 50
-EPN_PROP_NEIGHBORS = 0.1  # fraction of patients used as neighbours per query
+GRAPH_K = 10           # number of k-NN neighbours in the patient similarity graph
+GRAPH_METRIC = "cosine"
 
 
 def evaluate_epn(epn_module: EPNModule, epn_dm: EPNDataModule) -> tuple[float, float]:
     """Evaluate corrected survival curves on the validation patients."""
     epn_module.eval()
     with torch.no_grad():
-        corrected = epn_module.epn(epn_dm.val_df)  # [n_val, T]
+        # Pass both the val DataFrame and the precomputed val graph neighbour matrix
+        corrected = epn_module.epn(epn_dm.val_df, epn_dm.val_nn_idx)  # [n_val, T]
 
     corrected_np = np.clip(corrected.detach().cpu().numpy(), 1e-6, 1.0)
 
@@ -97,11 +100,17 @@ def run_single_split(split_index: int, n_splits: int) -> tuple[float, float]:
     mlp.eval()
     print("  MLP training complete. Weights frozen.")
 
-    # --- 2. Build EPN DataModule ---
-    epn_dm = EPNDataModule(base_datamodule=base_dm, mlp_module=mlp)
+    # --- 2. Build EPN DataModule (survival curves + k-NN graphs) ---
+    epn_dm = EPNDataModule(
+        base_datamodule=base_dm,
+        mlp_module=mlp,
+        graph_k=GRAPH_K,
+        graph_metric=GRAPH_METRIC,
+    )
     epn_dm.setup()
     print(f"  EPN DataModule ready. "
-          f"Time points: {len(epn_dm.timepoints)}, Features: {epn_dm.n_feats}")
+          f"Time points: {len(epn_dm.timepoints)}, "
+          f"Features: {epn_dm.n_feats}, Graph k: {GRAPH_K}")
 
     # --- 3. Train EPN ---
     epn = EPNModule(
@@ -109,7 +118,6 @@ def run_single_split(split_index: int, n_splits: int) -> tuple[float, float]:
         timepoints=epn_dm.timepoints,
         learning_rate=EPN_LR,
         weight_decay=EPN_WD,
-        prop_neighbors=EPN_PROP_NEIGHBORS,
     )
     pl.Trainer(
         max_epochs=EPN_EPOCHS,
