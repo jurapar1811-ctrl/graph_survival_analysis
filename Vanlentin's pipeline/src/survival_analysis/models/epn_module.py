@@ -1,22 +1,25 @@
 #!/usr/bin/env python3
 """
-EPNModule: Graph-based Error Propagation Network as a PyTorch Lightning module.
+EPNModule — graph-based Error Propagation Network as a Lightning module.
 
-Architecture
-------------
-- A k-NN patient similarity graph (built by EPNDataModule using graph_builder.py)
-  determines *which* patients are neighbours for each query patient.
-- A learned attention mechanism (key/query projections) determines *how much*
-  weight to give each neighbour's prediction error.
-- The weighted errors are added to the MLP baseline prediction as a correction.
+Design principle (per supervisor feedback):
+  Models should depend only on hyperparameters (dimensions, k, etc.),
+  NOT on DataFrames or dataset-specific objects.
 
-No imports from surv_epn — all logic is self-contained here.
+EPNModel.forward() takes pure tensors:
+    features         [N, F]      patient feature vectors
+    surv_preds       [N, T]      MLP baseline survival curves
+    labels           [N, 2]      (duration, event)
+    nn_idx           [N, k]      precomputed k-NN neighbour matrix
+    test_idx         [n_batch]   indices of patients to compute for
+    val_patient_idx  [n_val]|None  val patient indices (for attention masking)
+
+No DataFrames, no column-name parsing, no surv_epn imports.
 """
 
-from typing import List
+from typing import List, Optional
 
 import numpy as np
-import pandas as pd
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -26,168 +29,124 @@ from pycox.models.loss import CoxCCLoss
 
 
 # ---------------------------------------------------------------------------
-# Standalone helpers
+# Helpers
 # ---------------------------------------------------------------------------
 
-def _get_hazard_from_survival_curve(pred: torch.Tensor) -> torch.Tensor:
+def _survival_to_hazard(pred: torch.Tensor) -> torch.Tensor:
     """Convert survival curve [N, T] to discrete hazard [N, T]."""
     cum_hazard = -torch.log(torch.clamp(pred, min=1e-9))
     return torch.diff(cum_hazard, prepend=torch.zeros(pred.shape[0], 1))
 
 
 # ---------------------------------------------------------------------------
-# Core EPN model
+# Core model
 # ---------------------------------------------------------------------------
 
 class EPNModel(nn.Module):
     """
-    Graph-based Error Propagation Network.
+    Graph-constrained Error Propagation Network.
 
-    forward() inputs
-    ----------------
-    df      : pd.DataFrame  — patient data (features, MLP survival curves, mgmt cols)
-    nn_idx  : torch.Tensor [N, k]  — precomputed k-NN neighbour indices from graph_builder
-
-    forward() output
-    ----------------
-    torch.Tensor [n_batch, T] — graph-corrected survival curves for the batch patients
+    Hyperparameters only in __init__ — no data objects.
     """
-
-    _MGMT_COLS = {"label_duration", "label_event", "split",
-                  "pat_to_compute", "batch", "pat_id", "index"}
 
     def __init__(
         self,
         input_size: int,
+        timepoints: List[float],
         temp_att: float = 1.0,
         alpha: float = 0.0,
         beta: float = 0.0,
         n_control: int = 1,
     ) -> None:
         super().__init__()
-        self._input_size = input_size
-        self._temperature = temp_att
-        self._alpha = alpha
-        self._beta = beta
-        self._n_control = n_control
+        self._temperature  = temp_att
+        self._alpha        = alpha
+        self._beta         = beta
+        self._n_control    = n_control
+
+        self.register_buffer(
+            "_timepoints", torch.tensor(timepoints, dtype=torch.float32)
+        )
         self._dk = torch.sqrt(torch.tensor(float(input_size)))
 
-        # Learnable projections for attention scoring
-        self._key_projection = nn.Linear(input_size, input_size)
+        self._key_projection   = nn.Linear(input_size, input_size)
         self._query_projection = nn.Linear(input_size, input_size)
-        self._criterion = CoxCCLoss(shrink=0.0)
+        self._criterion        = CoxCCLoss(shrink=0.0)
 
     # ------------------------------------------------------------------
-    # Forward pass
+    # Forward
     # ------------------------------------------------------------------
 
-    def forward(self, df: pd.DataFrame, nn_idx: torch.Tensor) -> torch.Tensor:
-        """
-        Graph-corrected survival curves for batch patients.
-
-        For each batch patient i:
-          1. Look up its k neighbours from nn_idx[i].
-          2. Compute attention scores to those k neighbours (learned projections).
-          3. Mask self-attention and (in val mode) test-to-test attention.
-          4. Correction = softmax(att) · errors[neighbours].
-          5. Return MLP_pred[i] + correction[i].
-
-        Memory: [n_batch, k, T]  (vs [n_batch, n_batch, T] in the attention-only approach)
-        """
-        tp_cols = self._get_timepoint_cols(df)
-        T = len(tp_cols)
-        preds = torch.from_numpy(df[tp_cols].values).float()            # [N, T]
-        labels = torch.from_numpy(
-            df[["label_duration", "label_event"]].values
-        ).float()                                                         # [N, 2]
-        feat_cols = [c for c in df.columns if "feat_" in c]
-        features = torch.from_numpy(df[feat_cols].values).float()       # [N, F]
-        F_dim = features.shape[1]
-
-        test_idx = np.where(df.eval("pat_to_compute and batch"))[0]     # [n_batch]
+    def forward(
+        self,
+        features: torch.Tensor,
+        surv_preds: torch.Tensor,
+        labels: torch.Tensor,
+        nn_idx: torch.Tensor,
+        test_idx: torch.Tensor,
+        val_patient_idx: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Return graph-corrected survival curves for test_idx patients [n_batch, T]."""
+        F_dim   = features.shape[1]
         n_batch = len(test_idx)
-        training = (
-            len(np.where(df.eval(
-                'pat_to_compute and (split=="val" or split=="test")'
-            ))[0]) == 0
-        )
+        k       = nn_idx.shape[1]
 
-        # Errors for all N patients: [N, T]
-        timepoints = torch.tensor([float(c) for c in tp_cols])
-        errors = self._compute_error_survival(timepoints, preds, labels)
+        errors       = self._compute_error_survival(surv_preds, labels)  # [N, T]
+        neighbour_idx = nn_idx[test_idx]                                 # [n_batch, k]
 
-        # Neighbours for batch patients: [n_batch, k]
-        test_idx_t = torch.tensor(test_idx)
-        neighbour_idx = nn_idx[test_idx_t]                               # [n_batch, k]
-        k = neighbour_idx.shape[1]
-
-        # --- Graph-constrained attention ---
-        # Query: projected features of test patients        [n_batch, F]
-        # Key:   projected features of their k neighbours  [n_batch, k, F]
-        q = self._query_projection(features[test_idx_t])                 # [n_batch, F]
-        neighbour_feats = features[neighbour_idx]                        # [n_batch, k, F]
+        q    = self._query_projection(features[test_idx])
         keys = self._key_projection(
-            neighbour_feats.view(-1, F_dim)
-        ).view(n_batch, k, F_dim)                                        # [n_batch, k, F]
+            features[neighbour_idx].view(-1, F_dim)
+        ).view(n_batch, k, F_dim)
 
-        # Scaled dot-product: [n_batch, 1, F] × [n_batch, F, k] → [n_batch, k]
         att = torch.bmm(q.unsqueeze(1), keys.permute(0, 2, 1)).squeeze(1) / self._dk
 
-        # --- Masking ---
-        if not training:
-            # Val mode: prevent val patients from attending to other val patients
-            val_patient_idx = torch.tensor(
-                np.where(df["split"].values == "val")[0]
+        if val_patient_idx is not None:
+            att = att.masked_fill(
+                torch.isin(neighbour_idx, val_patient_idx),
+                torch.finfo(torch.float32).min,
             )
-            val_mask = torch.isin(neighbour_idx, val_patient_idx)        # [n_batch, k]
-            att = att.masked_fill(val_mask, torch.finfo(torch.float32).min)
         else:
-            # Train mode: zero out self-attention
-            self_mask = (neighbour_idx == test_idx_t.unsqueeze(1))       # [n_batch, k]
-            att = att.masked_fill(self_mask, torch.finfo(torch.float32).min)
+            att = att.masked_fill(
+                neighbour_idx == test_idx.unsqueeze(1),
+                torch.finfo(torch.float32).min,
+            )
 
-        att = F.softmax(att * self._temperature, dim=-1)                 # [n_batch, k]
-
-        # Weighted correction: [n_batch, k, T] → [n_batch, T]
-        neighbour_errors = errors[neighbour_idx]                         # [n_batch, k, T]
-        correction = torch.einsum("bk,bkt->bt", att, neighbour_errors)
-
-        return preds[test_idx_t] + correction                            # [n_batch, T]
+        att        = F.softmax(att * self._temperature, dim=-1)
+        correction = torch.einsum("bk,bkt->bt", att, errors[neighbour_idx])
+        return surv_preds[test_idx] + correction
 
     # ------------------------------------------------------------------
     # Loss
     # ------------------------------------------------------------------
 
-    def loss(
-        self,
-        timepoints: torch.Tensor,
-        pred: torch.Tensor,
-        y: torch.Tensor,
-    ) -> torch.Tensor:
-        """CoxCC loss with optional elastic-net penalty."""
+    def loss(self, pred: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+        """CoxCC loss + elastic-net penalty."""
         l1, l2 = torch.tensor(0.0), torch.tensor(0.0)
         for _, w in self.named_parameters():
             l1 = l1 + w.abs().sum()
             l2 = l2 + w.pow(2).sum()
 
-        pred_hazard = _get_hazard_from_survival_curve(pred)
-        g_case, g_control = self._make_case_control(timepoints, pred_hazard, y)
-        return self._criterion(g_case, g_control) + self._alpha * l1 + self._beta * l2
+        g_case, g_control = self._make_case_control(
+            self._timepoints, _survival_to_hazard(pred), y
+        )
+        return (
+            self._criterion(g_case, g_control)
+            + self._alpha * l1
+            + self._beta  * l2
+        )
 
     # ------------------------------------------------------------------
     # Private helpers
     # ------------------------------------------------------------------
 
-    @staticmethod
     def _compute_error_survival(
-        timepoints: torch.Tensor,
-        pred: torch.Tensor,
-        y: torch.Tensor,
+        self, pred: torch.Tensor, y: torch.Tensor
     ) -> torch.Tensor:
-        """Signed error between predicted survival curve and step-label [N, T]."""
-        T, N = timepoints.shape[0], y.shape[0]
+        tp = self._timepoints
+        T, N = tp.shape[0], y.shape[0]
         cont = torch.where(
-            timepoints.repeat(N, 1) > y[:, 0].repeat(T, 1).t(),
+            tp.repeat(N, 1) > y[:, 0].repeat(T, 1).t(),
             torch.zeros(N, T), torch.ones(N, T),
         )
         nan_fill = torch.full((N, T), float("nan"))
@@ -199,81 +158,56 @@ class EPNModel(nn.Module):
         return torch.where(cont.isnan(), torch.zeros_like(cont), cont - pred)
 
     @staticmethod
-    def _sorted_input_target(pred: torch.Tensor, y: torch.Tensor):
-        durations_np = y[:, 0].detach().cpu().numpy()
-        idx_sort = np.argsort(durations_np)
-        if (idx_sort == np.arange(len(idx_sort))).all():
+    def _sorted_input_target(pred, y):
+        idx = np.argsort(y[:, 0].detach().cpu().numpy())
+        if (idx == np.arange(len(idx))).all():
             return pred, y
-        idx_t = torch.tensor(idx_sort)
-        return pred[idx_t], y[idx_t]
+        t = torch.tensor(idx)
+        return pred[t], y[t]
 
     @staticmethod
-    def _make_at_risk_dict(durations: np.ndarray) -> dict:
+    def _make_at_risk_dict(durations):
         import pandas as _pd
         s = _pd.Series(durations)
-        allidx = s.index.values
         keys = s.drop_duplicates(keep="first")
-        return {t: allidx[ix:] for ix, t in keys.items()}
+        return {t: s.index.values[ix:] for ix, t in keys.items()}
 
     @staticmethod
-    def _sample_alive_from_dates(
-        dates: np.ndarray, at_risk_dict: dict, n_control: int = 1
-    ) -> np.ndarray:
-        lengths = np.array([at_risk_dict[x].shape[0] for x in dates])
+    def _sample_alive(dates, at_risk, n_control):
+        lengths = np.array([at_risk[x].shape[0] for x in dates])
         idx = (np.random.uniform(size=(n_control, dates.size)) * lengths).astype(int)
         samp = np.empty((dates.size, n_control), dtype=int)
         for it, t in enumerate(dates):
-            samp[it, :] = at_risk_dict[t][idx[:, it]]
+            samp[it, :] = at_risk[t][idx[:, it]]
         return samp
 
-    def _make_case_control(
-        self,
-        timepoints: torch.Tensor,
-        pred_hazard: torch.Tensor,
-        y: torch.Tensor,
-    ):
+    def _make_case_control(self, timepoints, pred_hazard, y):
         s_pred, s_y = self._sorted_input_target(pred_hazard, y)
-        at_risk = self._make_at_risk_dict(s_y[:, 0].detach().cpu().numpy())
-        tp_np = timepoints.detach().cpu().numpy()
+        at_risk  = self._make_at_risk_dict(s_y[:, 0].detach().cpu().numpy())
+        tp_np    = timepoints.detach().cpu().numpy()
 
         idx_event = torch.where(s_y[:, 1] == 1.0)[0]
-        tp_case = np.where(
-            [tp_np == s_y[i, 0].item() for i in idx_event]
-        )[1]
+        tp_case   = np.where([tp_np == s_y[i, 0].item() for i in idx_event])[1]
+        idx_case  = [[idx_event[i].item(), tp_case[i]] for i in range(len(idx_event))]
+        g_case    = torch.stack([s_pred[r, c] for r, c in idx_case])
 
-        idx_case = [[idx_event[i].item(), tp_case[i]] for i in range(len(idx_event))]
-        g_case = torch.stack([s_pred[r, c] for r, c in idx_case])
-
-        ctrl_idx = self._sample_alive_from_dates(
+        ctrl_idx  = self._sample_alive(
             s_y[idx_event, 0].detach().cpu().numpy(), at_risk, self._n_control
         )
-        ctrl_fmt = [
+        ctrl_fmt  = [
             [[ctrl_idx[i, j], tp_case[i]] for i in range(len(idx_event))]
             for j in range(self._n_control)
         ]
-        controls_list = [
+        controls  = [
             torch.stack([s_pred[r, c] for r, c in ctrl_fmt[j]])
             for j in range(self._n_control)
         ]
         g_control = (
-            tt.TupleTree(controls_list[0].unsqueeze(0))
+            tt.TupleTree(controls[0].unsqueeze(0))
             if self._n_control == 1
-            else tt.TupleTree(tuple(controls_list))
+            else tt.TupleTree(tuple(controls))
         )
         return g_case, g_control
-
-    @staticmethod
-    def _get_timepoint_cols(df: pd.DataFrame) -> list:
-        out = []
-        for c in df.columns:
-            if c in EPNModel._MGMT_COLS or "feat_" in c:
-                continue
-            try:
-                float(c)
-                out.append(c)
-            except (ValueError, TypeError):
-                pass
-        return sorted(out, key=float)
 
 
 # ---------------------------------------------------------------------------
@@ -281,10 +215,7 @@ class EPNModel(nn.Module):
 # ---------------------------------------------------------------------------
 
 class EPNModule(pl.LightningModule):
-    """PyTorch Lightning wrapper for graph-based EPNModel.
-
-    Each batch from EPNDataModule is a dict {"df": ..., "nn_idx": ...}.
-    """
+    """Lightning wrapper for EPNModel. Batches are tensor dicts from EPNDataModule."""
 
     def __init__(
         self,
@@ -298,34 +229,32 @@ class EPNModule(pl.LightningModule):
     ) -> None:
         super().__init__()
         self.save_hyperparameters(ignore=["timepoints"])
-        self._timepoints = torch.tensor(timepoints, dtype=torch.float32)
         self._lr = learning_rate
         self._wd = weight_decay
 
         self.epn = EPNModel(
             input_size=n_feats,
+            timepoints=timepoints,
             alpha=alpha,
             beta=beta,
             n_control=n_control,
         )
 
     def training_step(self, batch: dict, batch_idx: int) -> torch.Tensor:
-        df, nn_idx = batch["df"], batch["nn_idx"]
-        corrected = self.epn(df, nn_idx)
-
-        computed_mask = df.eval("pat_to_compute and batch").values
-        labels = torch.tensor(
-            df[computed_mask][["label_duration", "label_event"]].values,
-            dtype=torch.float32,
+        corrected = self.epn(
+            batch["features"], batch["surv_preds"], batch["labels"],
+            batch["nn_idx"],   batch["test_idx"],   batch["val_patient_idx"],
         )
-        loss = self.epn.loss(self._timepoints, corrected, labels)
+        loss = self.epn.loss(corrected, batch["labels"][batch["test_idx"]])
         self.log("train/loss", loss, on_step=False, on_epoch=True, batch_size=1)
         return loss
 
     def validation_step(self, batch: dict, batch_idx: int) -> None:
-        df, nn_idx = batch["df"], batch["nn_idx"]
         with torch.no_grad():
-            corrected = self.epn(df, nn_idx)
+            corrected = self.epn(
+                batch["features"], batch["surv_preds"], batch["labels"],
+                batch["nn_idx"],   batch["test_idx"],   batch["val_patient_idx"],
+            )
         self.log("val/n_preds", float(corrected.shape[0]),
                  on_step=False, on_epoch=True, batch_size=1)
 
