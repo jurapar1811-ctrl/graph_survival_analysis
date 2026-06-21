@@ -1,0 +1,8 @@
+# EPN model hyperparameters
+# Stage 2 of the MLP -> EPN pipeline.
+
+learning_rate: 0.001
+weight_decay: 0.0005
+alpha: 0.0   # L1 penalty weight
+beta: 0.0    # L2 penalty weight
+n_control: 1 # number of control samples for CoxCC loss

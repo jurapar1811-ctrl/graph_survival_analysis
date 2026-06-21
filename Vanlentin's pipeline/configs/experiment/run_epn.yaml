@@ -1,0 +1,50 @@
+# @package _global_
+#
+# MLP -> Graph-EPN pipeline experiment configuration.
+#
+# Usage:
+#   cd "Vanlentin's pipeline"
+#   python -m survival_analysis.experiments.run_epn_v2
+#
+# Override from command line:
+#   python -m survival_analysis.experiments.run_epn_v2 mlp.hidden_dim=128
+#   python -m survival_analysis.experiments.run_epn_v2 epn.learning_rate=0.0005
+#   python -m survival_analysis.experiments.run_epn_v2 graph.k=20
+
+defaults:
+  - _self_
+  - /paths: default
+
+task_name: "run_epn"
+
+# ── Data ──────────────────────────────────────────────────────────────────
+data:
+  json_splits_path: "${paths.data_dir}metabric/splits.json"
+  n_splits: 5
+
+# ── MLP (Stage 1) ─────────────────────────────────────────────────────────
+mlp:
+  hidden_dim: 64
+  epochs: 110
+  optimizer:
+    lr: 0.001
+    weight_decay: 0.0005
+
+# ── EPN (Stage 2) ─────────────────────────────────────────────────────────
+epn:
+  epochs: 50
+  learning_rate: 0.001
+  weight_decay: 0.0005
+  alpha: 0.0
+  beta: 0.0
+  n_control: 1
+
+# ── Graph ─────────────────────────────────────────────────────────────────
+graph:
+  k: 10
+  metric: "cosine"
+
+# ── Trainer ───────────────────────────────────────────────────────────────
+trainer:
+  accelerator: "cpu"
+  enable_progress_bar: true

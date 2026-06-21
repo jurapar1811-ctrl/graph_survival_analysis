@@ -1,0 +1,10 @@
+# MLP model hyperparameters for survival analysis
+# Stage 1 of the MLP -> EPN pipeline.
+
+hidden_dim: 64
+
+optimizer:
+  _target_: torch.optim.Adam
+  _partial_: true
+  lr: 0.001
+  weight_decay: 0.0005
