@@ -23,3 +23,20 @@ tests.ipynb
 # Large Jupyter notebooks
 surv_epn/main/Notebooks/codes_to_transmit_EPN.ipynb
 surv_epn/main/Notebooks/finalcodes_MLTcensEPN.ipynb
+
+# Excluded from repository
+surv_epn/
+AGENTS.md
+*.pptx
+*.docx
+*.pdf
+presentation_script_en.md
+presentation_structure.md
+slide_creation_prompt.md
+やったこと.md
+やること.md
+コード解説_タスク1と2.md
+コード解説_タスク4_統合案.md
+ミーティング.md
+最終ミーティング.md
+統合案_v2.md
