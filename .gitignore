@@ -17,3 +17,14 @@ node_modules/
 package-lock.json
 package.json
 tests.ipynb
+
+# Excluded from repository
+surv_epn/
+AGENTS.md
+src/
+configs/
+*.pptx
+*.docx
+*.pdf
+README.md
+pyproject.toml
