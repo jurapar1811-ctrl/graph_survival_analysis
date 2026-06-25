@@ -1,0 +1,32 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+.DS_Store
+~$*
+
+# Virtual environments
+.venv
+
+# The rest
+logs/
+.python-version
+.ipynb_checkpoints/
+node_modules/
+package-lock.json
+package.json
+tests.ipynb
+
+# Excluded from repository
+surv_epn/
+AGENTS.md
+src/
+configs/
+*.pptx
+*.docx
+*.pdf
+README.md
+pyproject.toml
